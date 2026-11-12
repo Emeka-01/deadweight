@@ -34,16 +34,79 @@ export function activate(context: vscode.ExtensionContext) {
 			clearTimeout(timer);
 			timer = setTimeout(() => void scanWorkspace(), 300);
 		}),
+		// Rescan while a .env file is being edited, so warnings move with the lines after a Quick Fix (or manual edit) instead of pointing at stale lines.
+		vscode.workspace.onDidChangeTextDocument((e) => {
+			if (!isEnvFile(e.document.uri)) {
+				return;
+			}
+			clearTimeout(timer);
+			timer = setTimeout(() => void scanWorkspace(), 300);
+		}),
 		{ dispose: () => clearTimeout(timer) }
+	);
+
+	context.subscriptions.push(
+		vscode.languages.registerCodeActionsProvider(
+			{ pattern: '**/.env' },
+			new RemoveUnusedKeyProvider(),
+			{ providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }
+		)
 	);
 
 	// Initial scan so warnings appear without running the command.
 	void scanWorkspace();
 }
 
+function isEnvFile(uri: vscode.Uri): boolean {
+	return uri.path.split('/').pop() === '.env';
+}
+
 function isRelevant(uri: vscode.Uri): boolean {
-	const name = uri.path.split('/').pop() ?? '';
-	return name === '.env' || /\.(js|jsx|ts|tsx|mjs|cjs|vue|svelte)$/.test(name);
+	return isEnvFile(uri) || /\.(js|jsx|ts|tsx|mjs|cjs|vue|svelte)$/.test(uri.path);
+}
+
+class RemoveUnusedKeyProvider implements vscode.CodeActionProvider {
+	provideCodeActions(
+		document: vscode.TextDocument,
+		_range: vscode.Range,
+		context: vscode.CodeActionContext
+	): vscode.CodeAction[] {
+		const ours = context.diagnostics.filter((d) => d.source === 'deadweight');
+		const actions: vscode.CodeAction[] = [];
+
+		for (const diagnostic of ours) {
+			const key = document.getText(diagnostic.range);
+			const action = new vscode.CodeAction(`Remove unused key '${key}'`, vscode.CodeActionKind.QuickFix);
+			action.edit = new vscode.WorkspaceEdit();
+			action.edit.delete(document.uri, fullLine(document, diagnostic.range.start.line));
+			action.diagnostics = [diagnostic];
+			action.isPreferred = true;
+			actions.push(action);
+		}
+
+		const all = (diagnostics.get(document.uri) ?? []).filter((d) => d.source === 'deadweight');
+		if (ours.length > 0 && all.length > 1) {
+			const action = new vscode.CodeAction(
+				`Remove all ${all.length} unused keys in this file`,
+				vscode.CodeActionKind.QuickFix
+			);
+			action.edit = new vscode.WorkspaceEdit();
+			for (const d of all) {
+				action.edit.delete(document.uri, fullLine(document, d.range.start.line));
+			}
+			action.diagnostics = [...all];
+			actions.push(action);
+		}
+
+		return actions;
+	}
+}
+
+// The whole line including its line break, so no blank line is left behind.
+function fullLine(document: vscode.TextDocument, line: number): vscode.Range {
+	return line + 1 < document.lineCount
+		? new vscode.Range(line, 0, line + 1, 0)
+		: document.lineAt(line).rangeIncludingLineBreak;
 }
 
 async function scanWorkspace(): Promise<number> {
