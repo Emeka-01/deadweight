@@ -3,8 +3,8 @@ import * as vscode from 'vscode';
 const SOURCE_GLOB = '**/*.{js,jsx,ts,tsx,mjs,cjs,vue,svelte}';
 const EXCLUDE_GLOB = '**/{node_modules,dist,out,build,.git}/**';
 
-// Matches process.env.KEY, process.env["KEY"] and process.env['KEY']
-const ENV_USAGE = /process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g;
+// Matches process.env.KEY / import.meta.env.KEY, plus the ["KEY"] and ['KEY'] forms
+const ENV_USAGE = /(?:process\.env|import\.meta\.env)(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g;
 
 // Matches a KEY=value line, optionally prefixed with "export"
 const ENV_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;
@@ -47,7 +47,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
-			{ pattern: '**/.env' },
+			{ pattern: '**/.env*' },
 			new RemoveUnusedKeyProvider(),
 			{ providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }
 		)
@@ -57,8 +57,16 @@ export function activate(context: vscode.ExtensionContext) {
 	void scanWorkspace();
 }
 
+// Templates list keys on purpose without using them, so they are never flagged.
+const ENV_TEMPLATE_SUFFIXES = ['.example', '.sample', '.template', '.dist'];
+
+// .env, .env.local, .env.production, ... but not .env.example and friends.
 function isEnvFile(uri: vscode.Uri): boolean {
-	return uri.path.split('/').pop() === '.env';
+	const name = uri.path.split('/').pop() ?? '';
+	if (name === '.env') {
+		return true;
+	}
+	return name.startsWith('.env.') && !ENV_TEMPLATE_SUFFIXES.some((s) => name.endsWith(s));
 }
 
 function isRelevant(uri: vscode.Uri): boolean {
@@ -112,7 +120,7 @@ function fullLine(document: vscode.TextDocument, line: number): vscode.Range {
 async function scanWorkspace(): Promise<number> {
 	diagnostics.clear();
 
-	const envFiles = await vscode.workspace.findFiles('**/.env', EXCLUDE_GLOB);
+	const envFiles = (await vscode.workspace.findFiles('**/.env*', EXCLUDE_GLOB)).filter(isEnvFile);
 	if (envFiles.length === 0) {
 		return 0;
 	}
@@ -134,7 +142,7 @@ async function scanWorkspace(): Promise<number> {
 			const range = new vscode.Range(i, start, i, start + match[1].length);
 			const diagnostic = new vscode.Diagnostic(
 				range,
-				`"${match[1]}" is never read via process.env in this workspace.`,
+				`"${match[1]}" is never read via process.env or import.meta.env in this workspace.`,
 				vscode.DiagnosticSeverity.Warning
 			);
 			diagnostic.source = 'deadweight';
