@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
-import { applyEdits, findNodeAtLocation, findNodeAtOffset, getNodePath, modify, parseTree } from 'jsonc-parser';
+import { findNodeAtLocation, findNodeAtOffset, getNodePath, parseTree } from 'jsonc-parser';
 import type { Node as JsonNode } from 'jsonc-parser';
+import { removeJsonNode } from './jsonEdit';
 
 const SOURCE_EXTS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'vue', 'svelte', 'astro'];
 const SOURCE_GLOB = `**/*.{${SOURCE_EXTS.join(',')}}`;
@@ -192,7 +193,7 @@ function removeJsonEntries(document: vscode.TextDocument, diags: readonly vscode
 	let text = original;
 	for (const path of paths) {
 		if (path) {
-			text = applyEdits(text, modify(text, path, undefined, { formattingOptions: { insertSpaces: true, tabSize: 2 } }));
+			text = removeJsonNode(text, path);
 		}
 	}
 
