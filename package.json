@@ -22,8 +22,33 @@
       {
         "command": "deadweight.scan",
         "title": "Deadweight: Scan Config Files"
+      },
+      {
+        "command": "deadweight.ignoreName",
+        "title": "Deadweight: Always Ignore Name"
       }
-    ]
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "deadweight.ignoreName",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Deadweight",
+      "properties": {
+        "deadweight.ignore": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Names Deadweight should never flag: `.env` keys, dependency names, or tsconfig path aliases and targets. `*` matches any characters, e.g. `NEXT_PUBLIC_*`. You can also silence a single line in a `.env` or tsconfig file with a `# deadweight-ignore` / `// deadweight-ignore` comment at the end of it or on the line above."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

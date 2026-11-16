@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { findNodeAtLocation, findNodeAtOffset, getNodePath, parseTree } from 'jsonc-parser';
 import type { Node as JsonNode } from 'jsonc-parser';
 import { removeJsonNode } from './jsonEdit';
+import { destructuredEnvKeys, envValueRefs, escapeRegExp, hasIgnoreComment, ignoreMatcher } from './matching';
 
 const SOURCE_EXTS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'vue', 'svelte', 'astro'];
 const SOURCE_GLOB = `**/*.{${SOURCE_EXTS.join(',')}}`;
@@ -83,7 +84,26 @@ export function activate(context: vscode.ExtensionContext) {
 				scheduleScan();
 			}
 		}),
+		vscode.workspace.onDidChangeConfiguration((e) => {
+			if (e.affectsConfiguration('deadweight')) {
+				scheduleScan();
+			}
+		}),
 		{ dispose: () => clearTimeout(timer) }
+	);
+
+	// Used by the "Always ignore" Quick Fix; hidden from the Command Palette.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('deadweight.ignoreName', async (name: string, scope: vscode.Uri) => {
+			const config = vscode.workspace.getConfiguration('deadweight', scope);
+			const current = config.get<string[]>('ignore', []);
+			if (!current.includes(name)) {
+				const target = vscode.workspace.workspaceFolders
+					? vscode.ConfigurationTarget.Workspace
+					: vscode.ConfigurationTarget.Global;
+				await config.update('ignore', [...current, name], target);
+			}
+		})
 	);
 
 	context.subscriptions.push(
@@ -166,8 +186,34 @@ class RemoveUnusedProvider implements vscode.CodeActionProvider {
 			actions.push(action);
 		}
 
+		for (const diagnostic of ours) {
+			const name = document.getText(diagnostic.range);
+
+			// package.json can't hold comments, so it only gets the setting-based option.
+			if (!isPackageJson(document.uri)) {
+				const action = new vscode.CodeAction(`Ignore '${name}' with a comment`, vscode.CodeActionKind.QuickFix);
+				action.edit = insertIgnoreComment(document, diagnostic.range.start.line, isEnv ? '#' : '//');
+				action.diagnostics = [diagnostic];
+				actions.push(action);
+			}
+
+			const action = new vscode.CodeAction(`Always ignore '${name}' in this workspace`, vscode.CodeActionKind.QuickFix);
+			action.command = { title: action.title, command: 'deadweight.ignoreName', arguments: [name, document.uri] };
+			action.diagnostics = [diagnostic];
+			actions.push(action);
+		}
+
 		return actions;
 	}
+}
+
+// Adds "# deadweight-ignore" (or "//") on its own line above, matching the line's indentation.
+function insertIgnoreComment(document: vscode.TextDocument, line: number, marker: string): vscode.WorkspaceEdit {
+	const indent = /^\s*/.exec(document.lineAt(line).text)?.[0] ?? '';
+	const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+	const edit = new vscode.WorkspaceEdit();
+	edit.insert(document.uri, new vscode.Position(line, 0), `${indent}${marker} deadweight-ignore${eol}`);
+	return edit;
 }
 
 function removeEnvLines(document: vscode.TextDocument, diags: readonly vscode.Diagnostic[]): vscode.WorkspaceEdit {
@@ -224,49 +270,125 @@ async function scanWorkspace(): Promise<{ envKeys: number; dependencies: number;
 		collectUsage(),
 	]);
 
-	diagnostics.clear();
+	const isIgnoredName = ignoreMatcher(vscode.workspace.getConfiguration('deadweight').get<string[]>('ignore', []));
+	const results = new Map<string, { uri: vscode.Uri; found: vscode.Diagnostic[] }>();
 	const counts = { envKeys: 0, dependencies: 0, paths: 0 };
 
-	for (const uri of envFiles) {
-		const found = await scanEnvFile(uri, usage);
-		diagnostics.set(uri, found);
-		counts.envKeys += found.length;
+	const envFound = await scanEnvFiles(envFiles, usage, isIgnoredName);
+	for (const [key, found] of envFound) {
+		results.set(key, { uri: found.uri, found: found.diagnostics });
+		counts.envKeys += found.diagnostics.length;
 	}
 	for (const uri of packageFiles) {
-		const found = await scanPackageJson(uri, usage);
-		diagnostics.set(uri, found);
+		const found = await withoutIgnored(uri, await scanPackageJson(uri, usage), isIgnoredName);
+		results.set(uri.toString(), { uri, found });
 		counts.dependencies += found.length;
 	}
 	for (const uri of tsconfigFiles) {
-		const found = await scanTsconfig(uri, usage);
-		diagnostics.set(uri, found);
+		const found = await withoutIgnored(uri, await scanTsconfig(uri, usage), isIgnoredName);
+		results.set(uri.toString(), { uri, found });
 		counts.paths += found.length;
 	}
 
+	diagnostics.clear();
+	for (const { uri, found } of results.values()) {
+		diagnostics.set(uri, found);
+	}
 	return counts;
 }
 
-async function scanEnvFile(uri: vscode.Uri, usage: Usage): Promise<vscode.Diagnostic[]> {
+// Drops findings silenced by the `deadweight.ignore` setting or a `deadweight-ignore` comment.
+async function withoutIgnored(
+	uri: vscode.Uri,
+	found: vscode.Diagnostic[],
+	isIgnoredName: (name: string) => boolean
+): Promise<vscode.Diagnostic[]> {
+	if (found.length === 0) {
+		return found;
+	}
 	const doc = await vscode.workspace.openTextDocument(uri);
-	const found: vscode.Diagnostic[] = [];
+	return found.filter((d) => {
+		const line = d.range.start.line;
+		const above = line > 0 ? doc.lineAt(line - 1).text : undefined;
+		return !isIgnoredName(doc.getText(d.range)) && !hasIgnoreComment(doc.lineAt(line).text, above);
+	});
+}
 
-	for (let i = 0; i < doc.lineCount; i++) {
-		const line = doc.lineAt(i);
-		const match = ENV_LINE.exec(line.text);
-		if (!match || usage.envKeys.has(match[1])) {
+interface EnvEntry {
+	uri: vscode.Uri;
+	key: string;
+	range: vscode.Range;
+	refs: string[];
+	ignored: boolean;
+}
+
+async function scanEnvFiles(
+	uris: vscode.Uri[],
+	usage: Usage,
+	isIgnoredName: (name: string) => boolean
+): Promise<Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>> {
+	const entries: EnvEntry[] = [];
+	for (const uri of uris) {
+		const doc = await vscode.workspace.openTextDocument(uri);
+		for (let i = 0; i < doc.lineCount; i++) {
+			const text = doc.lineAt(i).text;
+			const match = ENV_LINE.exec(text);
+			if (!match) {
+				continue;
+			}
+			const key = match[1];
+			const start = text.indexOf(key);
+			entries.push({
+				uri,
+				key,
+				range: new vscode.Range(i, start, i, start + key.length),
+				refs: envValueRefs(text),
+				ignored: isIgnoredName(key) || hasIgnoreComment(text, i > 0 ? doc.lineAt(i - 1).text : undefined),
+			});
+		}
+	}
+
+	// A key is used if code reads it, if it's ignored, or if a used key's value references it
+	// (URL=http://${HOST}:3000 keeps HOST alive as long as URL is used).
+	const used = new Set(usage.envKeys);
+	for (const entry of entries) {
+		if (entry.ignored) {
+			used.add(entry.key);
+		}
+	}
+	const queue = [...used];
+	while (queue.length > 0) {
+		const key = queue.pop()!;
+		for (const entry of entries) {
+			if (entry.key !== key) {
+				continue;
+			}
+			for (const ref of entry.refs) {
+				if (!used.has(ref)) {
+					used.add(ref);
+					queue.push(ref);
+				}
+			}
+		}
+	}
+
+	const results = new Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>();
+	for (const uri of uris) {
+		results.set(uri.toString(), { uri, diagnostics: [] });
+	}
+	for (const entry of entries) {
+		if (used.has(entry.key)) {
 			continue;
 		}
-		const start = line.text.indexOf(match[1]);
-		const range = new vscode.Range(i, start, i, start + match[1].length);
-		found.push(
+		results.get(entry.uri.toString())?.diagnostics.push(
 			makeDiagnostic(
-				range,
-				`"${match[1]}" is never read via process.env or import.meta.env in this workspace.`,
+				entry.range,
+				`"${entry.key}" is never read via process.env or import.meta.env, directly or through another key's \${...} reference.`,
 				UNUSED_ENV_KEY
 			)
 		);
 	}
-	return found;
+	return results;
 }
 
 async function scanPackageJson(uri: vscode.Uri, usage: Usage): Promise<vscode.Diagnostic[]> {
@@ -421,8 +543,7 @@ async function isDependencyUsed(name: string, usage: Usage, scripts: string, pac
 
 // True if `name` appears as a whole word: "tailwindcss" matches `tailwindcss: {}` but not "prettier-plugin-tailwindcss".
 function mentions(text: string, name: string): boolean {
-	const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	return new RegExp(`(^|[^\\w@/.-])${escaped}($|[^\\w/.-])`).test(text);
+	return new RegExp(`(^|[^\\w@/.-])${escapeRegExp(name)}($|[^\\w/.-])`).test(text);
 }
 
 async function binNames(name: string, packageJson: vscode.Uri): Promise<string[]> {
@@ -458,6 +579,9 @@ async function collectUsage(): Promise<Usage> {
 		const text = await readText(uri);
 		for (const match of text.matchAll(ENV_USAGE)) {
 			usage.envKeys.add(match[1] ?? match[2]);
+		}
+		for (const key of destructuredEnvKeys(text)) {
+			usage.envKeys.add(key);
 		}
 		for (const match of text.matchAll(IMPORT_USAGE)) {
 			usage.specifiers.add(match[1]);
