@@ -1,8 +1,21 @@
 import * as vscode from 'vscode';
-import { findNodeAtLocation, findNodeAtOffset, getNodePath, parseTree } from 'jsonc-parser';
+import { findNodeAtLocation, findNodeAtOffset, getNodePath, getNodeValue, parseTree } from 'jsonc-parser';
 import type { Node as JsonNode } from 'jsonc-parser';
 import { removeJsonNode } from './jsonEdit';
-import { destructuredEnvKeys, envValueRefs, escapeRegExp, hasIgnoreComment, ignoreMatcher } from './matching';
+import {
+	deepestContaining,
+	envKeysRead,
+	envValueRefs,
+	eslintShortNames,
+	hasDynamicEnvAccess,
+	hasIgnoreComment,
+	ignoreMatcher,
+	importSpecifiers,
+	isAliasUsed,
+	isInside,
+	mentions,
+	packageName,
+} from './matching';
 
 const SOURCE_EXTS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'vue', 'svelte', 'astro'];
 const SOURCE_GLOB = `**/*.{${SOURCE_EXTS.join(',')}}`;
@@ -14,17 +27,10 @@ const TSCONFIG_GLOB = '**/{tsconfig,jsconfig}*.json';
 const TSCONFIG_RE = /\/[tj]sconfig[^/]*\.json$/;
 const EXCLUDE_GLOB = '**/{node_modules,dist,out,build,coverage,.git,.next,.svelte-kit}/**';
 
-// Matches process.env.KEY / import.meta.env.KEY, plus the ["KEY"] and ['KEY'] forms
-const ENV_USAGE = /(?:process\.env|import\.meta\.env)(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g;
-
 // Matches a KEY=value line, optionally prefixed with "export"
 const ENV_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;
 
-// Matches `from 'x'`, `import 'x'`, `import('x')`, `require('x')` and `require.resolve('x')`
-const IMPORT_USAGE = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire(?:\.resolve)?\s*\(\s*)["']([^"'\s]+)["']/g;
-
-// Only runtime dependencies are checked: devDependencies are mostly CLI tools
-// and type packages, which would produce a lot of false warnings.
+// Runtime dependencies are always checked; devDependencies only with `deadweight.checkDevDependencies`, since they're mostly CLI tools and type packages that are harder to detect.
 const DEP_SECTIONS = ['dependencies', 'optionalDependencies'];
 
 // Extensions TypeScript tries when a path target has no wildcard ("@utils": ["src/utils"]).
@@ -174,7 +180,7 @@ class RemoveUnusedProvider implements vscode.CodeActionProvider {
 			const action = new vscode.CodeAction(`${label} '${document.getText(diagnostic.range)}'`, vscode.CodeActionKind.QuickFix);
 			action.edit = removeEdit(document, [diagnostic]);
 			action.diagnostics = [diagnostic];
-			action.isPreferred = true;
+			action.isPreferred = diagnostic.severity === vscode.DiagnosticSeverity.Warning;
 			actions.push(action);
 		}
 
@@ -255,37 +261,73 @@ function fullLine(document: vscode.TextDocument, line: number): vscode.Range {
 		: document.lineAt(line).rangeIncludingLineBreak;
 }
 
+// What one source or config file uses.
+interface FileUsage {
+	uri: vscode.Uri;
+	envKeys: string[];
+	specifiers: string[];
+	configText?: string;
+	dynamicEnv: boolean;
+	// Every word in the file, kept only for files with dynamic env access (see scanEnvFiles).
+	words?: Set<string>;
+}
+
+// What a group of files uses, merged.
 interface Usage {
 	envKeys: Set<string>;
 	packages: Set<string>;
 	specifiers: Set<string>;
-	configTexts: string[];
+	configs: { uri: vscode.Uri; text: string }[];
+	dynamicEnvFiles: vscode.Uri[];
+	words: Set<string>;
 }
 
 async function scanWorkspace(): Promise<{ envKeys: number; dependencies: number; paths: number }> {
-	const [envFiles, packageFiles, tsconfigFiles, usage] = await Promise.all([
+	const [envFiles, packageFiles, tsconfigFiles, fileUsages] = await Promise.all([
 		vscode.workspace.findFiles('**/.env*', EXCLUDE_GLOB).then((uris) => uris.filter(isEnvFile)),
 		vscode.workspace.findFiles('**/package.json', EXCLUDE_GLOB),
 		vscode.workspace.findFiles(TSCONFIG_GLOB, EXCLUDE_GLOB),
-		collectUsage(),
+		collectFileUsages(),
 	]);
+
+	// Monorepo support: each config file only counts usage from the package it belongs to (the deepest folder with a package.json above it), including any packages nested inside that one. A root package therefore sees the whole repo, while packages/api/.env only sees code under packages/api.
+	const packageRoots = packageFiles.map((uri) => vscode.Uri.joinPath(uri, '..').path);
+	const scopeOf = (uri: vscode.Uri): string =>
+		deepestContaining(uri.path, packageRoots) ?? vscode.workspace.getWorkspaceFolder(uri)?.uri.path ?? '/';
+	const usageCache = new Map<string, Usage>();
+	const usageFor = (uri: vscode.Uri): Usage => {
+		const scope = scopeOf(uri);
+		let usage = usageCache.get(scope);
+		if (!usage) {
+			usage = mergeUsage(fileUsages.filter((f) => isInside(f.uri.path, scope)));
+			usageCache.set(scope, usage);
+		}
+		return usage;
+	};
 
 	const isIgnoredName = ignoreMatcher(vscode.workspace.getConfiguration('deadweight').get<string[]>('ignore', []));
 	const results = new Map<string, { uri: vscode.Uri; found: vscode.Diagnostic[] }>();
 	const counts = { envKeys: 0, dependencies: 0, paths: 0 };
 
-	const envFound = await scanEnvFiles(envFiles, usage, isIgnoredName);
-	for (const [key, found] of envFound) {
-		results.set(key, { uri: found.uri, found: found.diagnostics });
-		counts.envKeys += found.diagnostics.length;
+	// .env files are checked per package, so a ${KEY} reference only counts within the same package.
+	const envByScope = new Map<string, vscode.Uri[]>();
+	for (const uri of envFiles) {
+		const scope = scopeOf(uri);
+		envByScope.set(scope, [...(envByScope.get(scope) ?? []), uri]);
+	}
+	for (const uris of envByScope.values()) {
+		for (const [key, found] of await scanEnvFiles(uris, usageFor(uris[0]), isIgnoredName)) {
+			results.set(key, { uri: found.uri, found: found.diagnostics });
+			counts.envKeys += found.diagnostics.length;
+		}
 	}
 	for (const uri of packageFiles) {
-		const found = await withoutIgnored(uri, await scanPackageJson(uri, usage), isIgnoredName);
+		const found = await withoutIgnored(uri, await scanPackageJson(uri, usageFor(uri)), isIgnoredName);
 		results.set(uri.toString(), { uri, found });
 		counts.dependencies += found.length;
 	}
 	for (const uri of tsconfigFiles) {
-		const found = await withoutIgnored(uri, await scanTsconfig(uri, usage), isIgnoredName);
+		const found = await withoutIgnored(uri, await scanTsconfig(uri, usageFor(uri)), isIgnoredName);
 		results.set(uri.toString(), { uri, found });
 		counts.paths += found.length;
 	}
@@ -295,6 +337,35 @@ async function scanWorkspace(): Promise<{ envKeys: number; dependencies: number;
 		diagnostics.set(uri, found);
 	}
 	return counts;
+}
+
+function mergeUsage(files: FileUsage[]): Usage {
+	const usage: Usage = {
+		envKeys: new Set(),
+		packages: new Set(),
+		specifiers: new Set(),
+		configs: [],
+		dynamicEnvFiles: [],
+		words: new Set(),
+	};
+	for (const file of files) {
+		file.envKeys.forEach((k) => usage.envKeys.add(k));
+		for (const specifier of file.specifiers) {
+			usage.specifiers.add(specifier);
+			const pkg = packageName(specifier);
+			if (pkg) {
+				usage.packages.add(pkg);
+			}
+		}
+		if (file.configText !== undefined) {
+			usage.configs.push({ uri: file.uri, text: file.configText });
+		}
+		if (file.dynamicEnv) {
+			usage.dynamicEnvFiles.push(file.uri);
+			file.words?.forEach((w) => usage.words.add(w));
+		}
+	}
+	return usage;
 }
 
 // Drops findings silenced by the `deadweight.ignore` setting or a `deadweight-ignore` comment.
@@ -348,11 +419,13 @@ async function scanEnvFiles(
 		}
 	}
 
-	// A key is used if code reads it, if it's ignored, or if a used key's value references it
-	// (URL=http://${HOST}:3000 keeps HOST alive as long as URL is used).
+	// Code that reads env vars dynamically (process.env[name], cleanEnv(process.env, {...})) can use any key. Keys named anywhere in those files count as used (validation schemas list them as object keys); the rest are still reported, but as information instead of warnings.
+	const dynamic = usage.dynamicEnvFiles.length > 0;
+
+	// A key is used if code reads it, if it's ignored, or if a used key's value references it (URL=http://${HOST}:3000 keeps HOST alive as long as URL is used).
 	const used = new Set(usage.envKeys);
 	for (const entry of entries) {
-		if (entry.ignored) {
+		if (entry.ignored || (dynamic && usage.words.has(entry.key))) {
 			used.add(entry.key);
 		}
 	}
@@ -372,6 +445,12 @@ async function scanEnvFiles(
 		}
 	}
 
+	const dynamicNote = dynamic
+		? ` It may still be used: ${vscode.workspace.asRelativePath(usage.dynamicEnvFiles[0])}${
+				usage.dynamicEnvFiles.length > 1 ? ` (and ${usage.dynamicEnvFiles.length - 1} more)` : ''
+			} reads env vars dynamically.`
+		: '';
+
 	const results = new Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>();
 	for (const uri of uris) {
 		results.set(uri.toString(), { uri, diagnostics: [] });
@@ -383,8 +462,9 @@ async function scanEnvFiles(
 		results.get(entry.uri.toString())?.diagnostics.push(
 			makeDiagnostic(
 				entry.range,
-				`"${entry.key}" is never read via process.env or import.meta.env, directly or through another key's \${...} reference.`,
-				UNUSED_ENV_KEY
+				`"${entry.key}" is never read via process.env or import.meta.env, directly or through another key's \${...} reference.${dynamicNote}`,
+				UNUSED_ENV_KEY,
+				dynamic ? vscode.DiagnosticSeverity.Information : vscode.DiagnosticSeverity.Warning
 			)
 		);
 	}
@@ -400,28 +480,90 @@ async function scanPackageJson(uri: vscode.Uri, usage: Usage): Promise<vscode.Di
 
 	const scriptsNode = findNodeAtLocation(root, ['scripts']);
 	const scripts = (scriptsNode?.children ?? []).map((prop) => String(prop.children?.[1]?.value ?? '')).join('\n');
-	const found: vscode.Diagnostic[] = [];
+	const checkDev = vscode.workspace.getConfiguration('deadweight', uri).get<boolean>('checkDevDependencies', false);
+	const sections = checkDev ? [...DEP_SECTIONS, 'devDependencies'] : DEP_SECTIONS;
 
-	for (const section of DEP_SECTIONS) {
+	const candidates: { name: string; section: string; keyNode: JsonNode }[] = [];
+	for (const section of sections) {
 		for (const prop of findNodeAtLocation(root, [section])?.children ?? []) {
 			const keyNode = prop.children?.[0];
 			const name = keyNode?.value;
-			if (!keyNode || typeof name !== 'string' || name.startsWith('@types/')) {
-				continue;
+			if (keyNode && typeof name === 'string' && !name.startsWith('@types/')) {
+				candidates.push({ name, section, keyNode });
 			}
-			if (await isDependencyUsed(name, usage, scripts, uri)) {
-				continue;
-			}
-			found.push(
-				makeDiagnostic(
-					stringRange(doc, keyNode),
-					`"${name}" is in ${section} but is never imported, required, or used in a script or config file.`,
-					UNUSED_DEPENDENCY
-				)
-			);
 		}
 	}
-	return found;
+
+	const used = new Set(usage.packages);
+	for (const { name } of candidates) {
+		if (await isDependencyUsed(name, usage, scripts, uri)) {
+			used.add(name);
+		}
+	}
+	await addPeerDependencies(used, uri);
+
+	return candidates
+		.filter(({ name }) => !used.has(name))
+		.map(({ name, section, keyNode }) =>
+			makeDiagnostic(
+				stringRange(doc, keyNode),
+				`"${name}" is in ${section} but is never imported, required, used in a script or config file, or needed as a peer by a used package.`,
+				UNUSED_DEPENDENCY
+			)
+		);
+}
+
+// Packages a used package declares as peerDependencies are used too: next needs react-dom even if your code never imports it. Repeats until nothing new is added, so peers of peers count as well.
+async function addPeerDependencies(used: Set<string>, packageJson: vscode.Uri): Promise<void> {
+	const queue = [...used];
+	const visited = new Set<string>();
+	while (queue.length > 0) {
+		const name = queue.pop()!;
+		if (visited.has(name)) {
+			continue;
+		}
+		visited.add(name);
+		const peers = (await readInstalledManifest(name, packageJson))?.peerDependencies;
+		if (!peers || typeof peers !== 'object') {
+			continue;
+		}
+		for (const peer of Object.keys(peers)) {
+			if (!used.has(peer)) {
+				used.add(peer);
+				queue.push(peer);
+			}
+		}
+	}
+}
+
+// Looks for node_modules/<relative> next to `from`, then in each parent folder (where monorepos hoist packages).
+async function findInNodeModules(from: vscode.Uri, relative: string): Promise<vscode.Uri | undefined> {
+	let dir = vscode.Uri.joinPath(from, '..');
+	for (let depth = 0; depth < 10; depth++) {
+		const candidate = vscode.Uri.joinPath(dir, 'node_modules', relative);
+		if (await exists(candidate)) {
+			return candidate;
+		}
+		const parent = vscode.Uri.joinPath(dir, '..');
+		if (parent.path === dir.path) {
+			break;
+		}
+		dir = parent;
+	}
+	return undefined;
+}
+
+// The package.json of an installed package.
+async function readInstalledManifest(name: string, packageJson: vscode.Uri): Promise<Record<string, unknown> | undefined> {
+	const manifest = await findInNodeModules(packageJson, `${name}/package.json`);
+	if (!manifest) {
+		return undefined;
+	}
+	try {
+		return JSON.parse(await readText(manifest));
+	} catch {
+		return undefined;
+	}
 }
 
 async function scanTsconfig(uri: vscode.Uri, usage: Usage): Promise<vscode.Diagnostic[]> {
@@ -432,9 +574,7 @@ async function scanTsconfig(uri: vscode.Uri, usage: Usage): Promise<vscode.Diagn
 		return [];
 	}
 
-	// Targets resolve against baseUrl if set, otherwise against the tsconfig's own folder.
-	const baseUrl = findNodeAtLocation(root, ['compilerOptions', 'baseUrl'])?.value;
-	const base = vscode.Uri.joinPath(uri, '..', typeof baseUrl === 'string' ? baseUrl : '.');
+	const base = await pathsBase(uri, root);
 	const found: vscode.Diagnostic[] = [];
 
 	for (const prop of pathsNode.children ?? []) {
@@ -486,23 +626,63 @@ async function scanTsconfig(uri: vscode.Uri, usage: Usage): Promise<vscode.Diagn
 	return found;
 }
 
-// "@/*" matches any import starting with "@/"; an alias without "*" must match exactly.
-function isAliasUsed(alias: string, specifiers: Set<string>): boolean {
-	const star = alias.indexOf('*');
-	if (star === -1) {
-		return specifiers.has(alias);
+// Path targets resolve against baseUrl, which may be set in this file or inherited through "extends" (resolved relative to the file that sets it). Without any baseUrl, against this file's own folder.
+async function pathsBase(uri: vscode.Uri, root: JsonNode): Promise<vscode.Uri> {
+	const own = findNodeAtLocation(root, ['compilerOptions', 'baseUrl'])?.value;
+	if (typeof own === 'string') {
+		return vscode.Uri.joinPath(uri, '..', own);
 	}
-	const prefix = alias.slice(0, star);
-	const suffix = alias.slice(star + 1);
-	if (!prefix && !suffix) {
-		return true;
+	return (await inheritedBaseUrl(uri, root, 0)) ?? vscode.Uri.joinPath(uri, '..');
+}
+
+async function inheritedBaseUrl(uri: vscode.Uri, root: JsonNode, depth: number): Promise<vscode.Uri | undefined> {
+	if (depth > 10) {
+		return undefined;
 	}
-	for (const s of specifiers) {
-		if (s.length >= prefix.length + suffix.length && s.startsWith(prefix) && s.endsWith(suffix)) {
-			return true;
+	const extendsNode = findNodeAtLocation(root, ['extends']);
+	const value: unknown = extendsNode ? getNodeValue(extendsNode) : undefined;
+	const specs = typeof value === 'string' ? [value] : Array.isArray(value) ? value.filter((v) => typeof v === 'string') : [];
+
+	// With several configs in "extends", later ones override earlier ones, so check them last-first.
+	for (const spec of [...specs].reverse()) {
+		const parent = await resolveExtends(uri, spec);
+		if (!parent) {
+			continue;
+		}
+		const parentRoot = parseTree(await readText(parent), [], { allowTrailingComma: true });
+		if (!parentRoot) {
+			continue;
+		}
+		const baseUrl = findNodeAtLocation(parentRoot, ['compilerOptions', 'baseUrl'])?.value;
+		if (typeof baseUrl === 'string') {
+			return vscode.Uri.joinPath(parent, '..', baseUrl);
+		}
+		const deeper = await inheritedBaseUrl(parent, parentRoot, depth + 1);
+		if (deeper) {
+			return deeper;
 		}
 	}
-	return false;
+	return undefined;
+}
+
+// "./tsconfig.base.json", "../base" or a package like "@tsconfig/node20/tsconfig.json".
+async function resolveExtends(from: vscode.Uri, spec: string): Promise<vscode.Uri | undefined> {
+	if (spec.startsWith('.') || spec.startsWith('/')) {
+		for (const candidate of [spec, `${spec}.json`]) {
+			const uri = vscode.Uri.joinPath(from, '..', candidate);
+			if (await exists(uri)) {
+				return uri;
+			}
+		}
+		return undefined;
+	}
+	for (const candidate of [spec, `${spec}.json`, `${spec}/tsconfig.json`]) {
+		const uri = await findInNodeModules(from, candidate);
+		if (uri && (await isFile(uri))) {
+			return uri;
+		}
+	}
+	return undefined;
 }
 
 async function targetExists(base: vscode.Uri, target: string): Promise<boolean> {
@@ -529,11 +709,27 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
 	}
 }
 
+async function isFile(uri: vscode.Uri): Promise<boolean> {
+	try {
+		return (await vscode.workspace.fs.stat(uri)).type === vscode.FileType.File;
+	} catch {
+		return false;
+	}
+}
+
 async function isDependencyUsed(name: string, usage: Usage, scripts: string, packageJson: vscode.Uri): Promise<boolean> {
 	if (usage.packages.has(name)) {
 		return true;
 	}
-	if (mentions(scripts, name) || usage.configTexts.some((text) => mentions(text, name))) {
+	if (mentions(scripts, name) || usage.configs.some(({ text }) => mentions(text, name))) {
+		return true;
+	}
+	// ESLint configs refer to plugins and shared configs by short name ("react" for eslint-plugin-react).
+	const shortNames = eslintShortNames(name);
+	if (
+		shortNames.length > 0 &&
+		usage.configs.some(({ uri, text }) => fileName(uri).includes('eslint') && shortNames.some((s) => mentions(text, s)))
+	) {
 		return true;
 	}
 	// CLI tools are run by their command name, which can differ from the package name (typescript -> tsc).
@@ -541,34 +737,24 @@ async function isDependencyUsed(name: string, usage: Usage, scripts: string, pac
 	return bins.some((bin) => mentions(scripts, bin));
 }
 
-// True if `name` appears as a whole word: "tailwindcss" matches `tailwindcss: {}` but not "prettier-plugin-tailwindcss".
-function mentions(text: string, name: string): boolean {
-	return new RegExp(`(^|[^\\w@/.-])${escapeRegExp(name)}($|[^\\w/.-])`).test(text);
-}
-
 async function binNames(name: string, packageJson: vscode.Uri): Promise<string[]> {
-	const manifest = vscode.Uri.joinPath(packageJson, '..', 'node_modules', name, 'package.json');
-	try {
-		const bin = JSON.parse(await readText(manifest)).bin;
-		if (typeof bin === 'string') {
-			return [name.split('/').pop() ?? name];
-		}
-		if (bin && typeof bin === 'object') {
-			return Object.keys(bin);
-		}
-	} catch {
-		// Not installed, or no readable manifest: no bin names to check.
+	const bin = (await readInstalledManifest(name, packageJson))?.bin;
+	if (typeof bin === 'string') {
+		return [name.split('/').pop() ?? name];
+	}
+	if (bin && typeof bin === 'object') {
+		return Object.keys(bin);
 	}
 	return [];
 }
 
-async function collectUsage(): Promise<Usage> {
-	const usage: Usage = { envKeys: new Set(), packages: new Set(), specifiers: new Set(), configTexts: [] };
+async function collectFileUsages(): Promise<FileUsage[]> {
 	const [sources, configs] = await Promise.all([
 		vscode.workspace.findFiles(SOURCE_GLOB, EXCLUDE_GLOB),
 		vscode.workspace.findFiles(CONFIG_GLOB, EXCLUDE_GLOB),
 	]);
 
+	const files: FileUsage[] = [];
 	const seen = new Set<string>();
 	for (const uri of [...sources, ...configs]) {
 		if (seen.has(uri.toString())) {
@@ -577,36 +763,17 @@ async function collectUsage(): Promise<Usage> {
 		seen.add(uri.toString());
 
 		const text = await readText(uri);
-		for (const match of text.matchAll(ENV_USAGE)) {
-			usage.envKeys.add(match[1] ?? match[2]);
-		}
-		for (const key of destructuredEnvKeys(text)) {
-			usage.envKeys.add(key);
-		}
-		for (const match of text.matchAll(IMPORT_USAGE)) {
-			usage.specifiers.add(match[1]);
-			const pkg = packageName(match[1]);
-			if (pkg) {
-				usage.packages.add(pkg);
-			}
-		}
-		if (isConfigFile(uri)) {
-			usage.configTexts.push(text);
-		}
+		const dynamicEnv = hasDynamicEnvAccess(text);
+		files.push({
+			uri,
+			envKeys: envKeysRead(text),
+			specifiers: importSpecifiers(text),
+			configText: isConfigFile(uri) ? text : undefined,
+			dynamicEnv,
+			words: dynamicEnv ? new Set(text.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) : undefined,
+		});
 	}
-	return usage;
-}
-
-// "lodash/fp" -> "lodash", "@scope/pkg/sub" -> "@scope/pkg"; relative paths and node:/virtual: imports -> undefined.
-function packageName(specifier: string): string | undefined {
-	if (/^[./#]/.test(specifier) || specifier.includes(':')) {
-		return undefined;
-	}
-	const parts = specifier.split('/');
-	if (specifier.startsWith('@')) {
-		return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : undefined;
-	}
-	return parts[0];
+	return files;
 }
 
 // Prefers the open editor's text, so unsaved changes are taken into account.
@@ -623,8 +790,13 @@ function stringRange(doc: vscode.TextDocument, node: JsonNode): vscode.Range {
 	return new vscode.Range(doc.positionAt(node.offset + 1), doc.positionAt(node.offset + node.length - 1));
 }
 
-function makeDiagnostic(range: vscode.Range, message: string, code: string): vscode.Diagnostic {
-	const diagnostic = new vscode.Diagnostic(range, message, vscode.DiagnosticSeverity.Warning);
+function makeDiagnostic(
+	range: vscode.Range,
+	message: string,
+	code: string,
+	severity = vscode.DiagnosticSeverity.Warning
+): vscode.Diagnostic {
+	const diagnostic = new vscode.Diagnostic(range, message, severity);
 	diagnostic.source = 'deadweight';
 	diagnostic.code = code;
 	return diagnostic;

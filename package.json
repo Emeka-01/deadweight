@@ -46,6 +46,11 @@
           },
           "default": [],
           "markdownDescription": "Names Deadweight should never flag: `.env` keys, dependency names, or tsconfig path aliases and targets. `*` matches any characters, e.g. `NEXT_PUBLIC_*`. You can also silence a single line in a `.env` or tsconfig file with a `# deadweight-ignore` / `// deadweight-ignore` comment at the end of it or on the line above."
+        },
+        "deadweight.checkDevDependencies": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also check `devDependencies` in `package.json`. Off by default: dev tools are often used in ways Deadweight can't see (by your editor, or by another tool's config), so expect to ignore a few with `#deadweight.ignore#`."
         }
       }
     }
