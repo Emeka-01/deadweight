@@ -3,6 +3,7 @@ import { findNodeAtLocation, findNodeAtOffset, getNodePath, getNodeValue, parseT
 import type { Node as JsonNode } from 'jsonc-parser';
 import { removeJsonNode } from './jsonEdit';
 import {
+	CONFIG_GLOBS,
 	deepestContaining,
 	envKeysRead,
 	envValueRefs,
@@ -12,6 +13,7 @@ import {
 	ignoreMatcher,
 	importSpecifiers,
 	isAliasUsed,
+	isConfigPath,
 	isInside,
 	mentions,
 	packageName,
@@ -20,9 +22,6 @@ import {
 const SOURCE_EXTS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'vue', 'svelte', 'astro'];
 const SOURCE_GLOB = `**/*.{${SOURCE_EXTS.join(',')}}`;
 const SOURCE_RE = new RegExp(`\\.(${SOURCE_EXTS.join('|')})$`);
-// Tool config files (vite.config.ts, .babelrc, tsconfig.json, ...) often name packages without importing them.
-const CONFIG_GLOB = '**/{*.config.*,.*rc,.*rc.*,tsconfig*.json,jsconfig*.json}';
-const CONFIG_RE = /(\.config\.[^./]+|\/\.[^/]*rc(\.[^./]+)?|\/[tj]sconfig[^/]*\.json)$/;
 const TSCONFIG_GLOB = '**/{tsconfig,jsconfig}*.json';
 const TSCONFIG_RE = /\/[tj]sconfig[^/]*\.json$/;
 const EXCLUDE_GLOB = '**/{node_modules,dist,out,build,coverage,.git,.next,.svelte-kit}/**';
@@ -153,7 +152,7 @@ function isTsconfig(uri: vscode.Uri): boolean {
 }
 
 function isConfigFile(uri: vscode.Uri): boolean {
-	return CONFIG_RE.test(uri.path);
+	return isConfigPath(uri.path);
 }
 
 function isRelevant(uri: vscode.Uri): boolean {
@@ -749,14 +748,13 @@ async function binNames(name: string, packageJson: vscode.Uri): Promise<string[]
 }
 
 async function collectFileUsages(): Promise<FileUsage[]> {
-	const [sources, configs] = await Promise.all([
-		vscode.workspace.findFiles(SOURCE_GLOB, EXCLUDE_GLOB),
-		vscode.workspace.findFiles(CONFIG_GLOB, EXCLUDE_GLOB),
-	]);
+	const found = await Promise.all(
+		[SOURCE_GLOB, ...CONFIG_GLOBS].map((glob) => vscode.workspace.findFiles(glob, EXCLUDE_GLOB))
+	);
 
 	const files: FileUsage[] = [];
 	const seen = new Set<string>();
-	for (const uri of [...sources, ...configs]) {
+	for (const uri of found.flat()) {
 		if (seen.has(uri.toString())) {
 			continue;
 		}

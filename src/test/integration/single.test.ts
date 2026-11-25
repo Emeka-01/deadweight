@@ -26,7 +26,8 @@ suite('single package', () => {
 	});
 
 	test('package.json: imported, script-run and peer dependencies are kept', async () => {
-		// Not flagged: chalk (imported), nodemon (dev script), fake-framework (imported), fake-renderer (its peer).
+		// Not flagged: chalk (imported), nodemon (dev script), fake-framework (imported), fake-renderer (its peer),
+		// tsconfig-paths (only run by the Dockerfile: `node -r tsconfig-paths/register`).
 		assert.deepStrictEqual(await findings('package.json'), [
 			warning('is-odd', 'unused-dependency'),
 			warning('left-pad', 'unused-dependency'),

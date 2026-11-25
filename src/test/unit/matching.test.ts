@@ -10,6 +10,7 @@ import {
 	ignoreMatcher,
 	importSpecifiers,
 	isAliasUsed,
+	isConfigPath,
 	mentions,
 	packageName,
 } from '../../matching';
@@ -121,6 +122,35 @@ suite('matching: imports and package names', () => {
 		assert.deepStrictEqual(eslintShortNames('@acme/eslint-config-base'), ['@acme/base']);
 		assert.deepStrictEqual(eslintShortNames('react'), []);
 	});
+});
+
+suite('matching: config files', () => {
+	const config = [
+		'/p/vite.config.ts',
+		'/p/.babelrc',
+		'/p/.eslintrc.json',
+		'/p/tsconfig.base.json',
+		'/p/server/Dockerfile',
+		'/p/Dockerfile.prod',
+		'/p/api.dockerfile',
+		'/p/Procfile',
+		'/p/server/nodemon.json',
+		'/p/docker-compose.yml',
+		'/p/compose.prod.yaml',
+		'/p/render.yaml',
+		'/p/vercel.json',
+		'/p/netlify.toml',
+		'/p/.github/workflows/ci.yml',
+	];
+	for (const path of config) {
+		test(`config: ${path}`, () => assert.strictEqual(isConfigPath(path), true));
+	}
+
+	// Lockfiles name every installed package, so reading them would hide every unused dependency.
+	const notConfig = ['/p/src/app.ts', '/p/package.json', '/p/package-lock.json', '/p/pnpm-lock.yaml', '/p/yarn.lock', '/p/ci.yml'];
+	for (const path of notConfig) {
+		test(`not config: ${path}`, () => assert.strictEqual(isConfigPath(path), false));
+	}
 });
 
 suite('matching: tsconfig path aliases', () => {

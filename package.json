@@ -1,13 +1,24 @@
 {
   "name": "deadweight",
-  "displayName": "deadweight",
+  "displayName": "Deadweight",
   "description": "Find and remove unused dependencies, stale .env keys, and dead tsconfig paths.",
-  "version": "0.0.1",
+  "version": "0.1.0",
+  "publisher": "MechX",
+  "license": "MIT",
   "engines": {
-    "vscode": "^1.146.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
-    "Other"
+    "Linters"
+  ],
+  "keywords": [
+    "env",
+    "dotenv",
+    "dependencies",
+    "unused",
+    "tsconfig",
+    "cleanup",
+    "monorepo"
   ],
   "activationEvents": [
     "workspaceContains:**/.env",
@@ -73,7 +84,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "@types/vscode": "^1.146.0",
+    "@types/vscode": "1.90.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
     "esbuild": "^0.28.1",

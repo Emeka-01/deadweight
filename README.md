@@ -112,7 +112,3 @@ KEPT_FOR_LATER=1
 - **All `.env` files in a package share one set of usage.** Deadweight doesn't know which file each environment (development, production) loads.
 - **Detecting dynamic env access** can be set off by `process.env` appearing in a comment or string. This only softens warnings to information, so it never hides anything.
 - **Paths in an extended tsconfig** are checked in the file that defines them, not in the files that extend it.
-
-## Release notes
-
-See [CHANGELOG.md](CHANGELOG.md).

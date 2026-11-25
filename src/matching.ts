@@ -147,3 +147,29 @@ export function ignoreMatcher(patterns: readonly string[]): (name: string) => bo
 export function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+// Files that can name a package without importing it: tool configs (vite.config.ts, .babelrc, tsconfig.json)
+// and files that run the app (Dockerfile, Procfile, nodemon.json, compose files, hosting and CI configs),
+// e.g. `node -r tsconfig-paths/register` in a Dockerfile.
+export const CONFIG_GLOBS = [
+	'**/{*.config.*,.*rc,.*rc.*,tsconfig*.json,jsconfig*.json}',
+	'**/{Dockerfile,Dockerfile.*,*.dockerfile,Procfile,nodemon.json,render.yaml,vercel.json,netlify.toml}',
+	'**/{docker-compose*.yml,docker-compose*.yaml,compose*.yml,compose*.yaml}',
+	'**/.github/workflows/*.{yml,yaml}',
+];
+
+const CONFIG_NAME_PATTERNS = [
+	/\.config\.[^.]+$/,
+	/^\..*rc(\.[^.]+)?$/,
+	/^[tj]sconfig.*\.json$/,
+	/^Dockerfile(\..+)?$/i,
+	/\.dockerfile$/i,
+	/^(Procfile|nodemon\.json|render\.yaml|vercel\.json|netlify\.toml)$/,
+	/^(docker-)?compose.*\.ya?ml$/,
+];
+
+// Must agree with CONFIG_GLOBS. `path` uses "/" separators.
+export function isConfigPath(path: string): boolean {
+	const name = path.split('/').pop() ?? '';
+	return CONFIG_NAME_PATTERNS.some((p) => p.test(name)) || /\/\.github\/workflows\/[^/]+\.ya?ml$/.test(path);
+}

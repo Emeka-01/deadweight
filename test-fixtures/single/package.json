@@ -9,6 +9,7 @@
     "nodemon": "^3.0.0",
     "is-odd": "^3.0.1",
     "fake-framework": "^1.0.0",
-    "fake-renderer": "^1.0.0"
+    "fake-renderer": "^1.0.0",
+    "tsconfig-paths": "^4.0.0"
   }
 }
