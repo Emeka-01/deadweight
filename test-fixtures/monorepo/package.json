@@ -1,0 +1,9 @@
+{
+  "name": "monorepo-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "devDependencies": {
+    "eslint-plugin-react": "^7.0.0",
+    "unused-tool": "^1.0.0"
+  }
+}

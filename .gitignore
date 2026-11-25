@@ -3,3 +3,6 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+# Sample projects used by the integration tests need their fake installed packages.
+!test-fixtures/single/node_modules/

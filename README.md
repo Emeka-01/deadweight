@@ -1,71 +1,118 @@
-# deadweight README
+# Deadweight
 
-This is the README for your extension "deadweight". After writing up a brief description, we recommend including the following sections.
+Find and remove the config nobody uses anymore: **unused dependencies**, **stale `.env` keys**, and **dead tsconfig paths**.
 
-## Features
+Deadweight checks your project in the background and underlines what's unused, right in the file where it's declared. Press `Ctrl+.` (`Cmd+.` on macOS) to remove the entry or to ignore it.
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+## What it finds
 
-For example if there is an image subfolder under your extension project workspace:
+| Where | What gets flagged |
+|---|---|
+| `.env`, `.env.local`, `.env.production`, … | Keys your code never reads |
+| `package.json` | Dependencies nothing imports, runs, or needs |
+| `tsconfig.json` / `jsconfig.json` | Path aliases no import uses, aliases whose folders are gone, and individual missing targets |
 
-\!\[feature X\]\(images/feature-x.png\)
+Findings show up as warnings in the editor and in the **Problems** panel (`Ctrl+Shift+M`).
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+## Quick Fixes
 
-## Requirements
+On any finding, press `Ctrl+.` or click the lightbulb:
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- **Remove** the key, dependency or path entry. Commas are fixed so your JSON stays valid, and the rest of the file keeps its formatting.
+- **Remove all** flagged entries in the file at once.
+- **Ignore with a comment** (`.env` and tsconfig files): adds a `deadweight-ignore` comment above the line.
+- **Always ignore in this workspace**: adds the name to the `deadweight.ignore` setting.
 
-## Extension Settings
+Removals are ordinary edits: nothing is saved until you save, and `Ctrl+Z` undoes them. After removing dependencies, run `npm install` (or your package manager's equivalent) to update your lockfile.
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+## How Deadweight decides something is used
 
-For example:
+Deadweight reads your source files (`.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts`, `.cts`, `.vue`, `.svelte`, `.astro`) and tool config files. It skips `node_modules`, `dist`, `out`, `build`, `coverage`, `.git`, `.next` and `.svelte-kit`.
 
-This extension contributes the following settings:
+**An `.env` key is used if:**
+- code reads it: `process.env.KEY`, `process.env["KEY"]`, `process.env?.KEY` or `import.meta.env.KEY`;
+- code destructures it: `const { KEY } = process.env`;
+- another used key references it: `URL=http://${HOST}:3000` keeps `HOST` as long as `URL` is used.
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+Template files (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`) are never checked.
 
-## Known Issues
+**A dependency is used if:**
+- code imports or requires it, including subpaths like `lodash/fp`;
+- a `package.json` script runs it, by package name or by the command it installs (`tsc` counts as using `typescript`);
+- a config file names it, for example `plugins: { tailwindcss: {} }` in `postcss.config.js`, or an ESLint plugin's short name (`"react"` for `eslint-plugin-react`);
+- a package you use lists it in `peerDependencies`. For example, `next` needs `react-dom` even if you never import `react-dom` yourself.
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+`dependencies` and `optionalDependencies` are always checked. `devDependencies` are checked only if you turn on `deadweight.checkDevDependencies`. `@types/*` packages are never flagged.
 
-## Release Notes
+**A tsconfig path alias is used if** an import matches it: `@/*` matches `@/components/Button`. Targets are resolved the way TypeScript does, from `baseUrl` if it's set (including a `baseUrl` inherited through `"extends"`), otherwise from the tsconfig's own folder.
 
-Users appreciate release notes as you update your extension.
+## Monorepos
 
-### 1.0.0
+Each file is checked against the code in its own package: the nearest folder above it with a `package.json`. Packages nested inside that folder count too.
 
-Initial release of ...
+- `packages/api/.env` and `packages/api/package.json` only count code under `packages/api`.
+- Files at the repository root count code from the whole repo, since shared root config is normal.
 
-### 1.0.1
+## When Deadweight can't be sure
 
-Fixed issue #.
+Some code reads environment variables in ways that hide which keys it uses:
 
-### 1.1.0
+```js
+const value = process.env[name];                          // computed key
+export const env = cleanEnv(process.env, { API_KEY: str() }); // the whole object
+```
 
-Added features X, Y, and Z.
+When a package contains code like this, Deadweight:
+- counts any key **named anywhere in those files** as used, which covers validation schemas such as envalid and zod;
+- reports the remaining unused keys as **information** (blue) instead of warnings, and names the file that reads env vars dynamically.
 
----
+## Ignoring findings
 
-## Following extension guidelines
+**One line:** add a comment at the end of the line or on the line above it.
 
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
+```sh
+# .env
+LEGACY_TOKEN=abc # deadweight-ignore
 
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
+# deadweight-ignore
+KEPT_FOR_LATER=1
+```
 
-## Working with Markdown
+```jsonc
+// tsconfig.json
+"paths": {
+  // deadweight-ignore
+  "@legacy/*": ["./legacy/*"]
+}
+```
 
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
+**By name, everywhere:** list names in the `deadweight.ignore` setting. `*` matches any characters.
 
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
+```json
+"deadweight.ignore": ["NEXT_PUBLIC_*", "left-pad", "@legacy/*"]
+```
 
-## For more information
+`package.json` doesn't allow comments, so use the setting for dependencies.
 
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
+## Settings
 
-**Enjoy!**
+| Setting | Default | Description |
+|---|---|---|
+| `deadweight.ignore` | `[]` | Names never to flag: `.env` keys, dependency names, or tsconfig aliases and targets. Supports `*`. |
+| `deadweight.checkDevDependencies` | `false` | Also check `devDependencies`. Dev tools are often used in ways Deadweight can't see (by your editor, or another tool's config), so expect to ignore a few. |
+
+## Commands
+
+- **Deadweight: Scan Config Files**: scans now and shows a summary. You rarely need it, because Deadweight scans automatically when a project opens, when you save a source, config, `.env`, `package.json` or tsconfig file, and while you edit those last three.
+
+## Known limitations
+
+- **Dependencies** are only recognized as peers or command-line tools once they're installed. Before `npm install`, there's no `node_modules` to read.
+- **A package your framework loads by convention**, without naming it anywhere, can be flagged. Use `deadweight.ignore` for these.
+- **All `.env` files in a package share one set of usage.** Deadweight doesn't know which file each environment (development, production) loads.
+- **Detecting dynamic env access** can be set off by `process.env` appearing in a comment or string. This only softens warnings to information, so it never hides anything.
+- **Paths in an extended tsconfig** are checked in the file that defines them, not in the files that extend it.
+
+## Release notes
+
+See [CHANGELOG.md](CHANGELOG.md).
